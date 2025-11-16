@@ -63,27 +63,72 @@ const COLLECTION_PREFIX = 'ytchatbot_';
 
 const buildCollectionName = (videoId: string, transcriptId: string) => `${COLLECTION_PREFIX}${videoId}_${transcriptId}`;
 
-async function fetchTranscriptWithFallback(videoIdentifier: string) {
+// Helper function to add timeout to promises
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    return Promise.race([
+        promise,
+        new Promise<T>((_, reject) => 
+            setTimeout(() => reject(new Error(`Operation timed out after ${timeoutMs}ms`)), timeoutMs)
+        )
+    ]);
+}
+
+async function fetchTranscriptWithFallback(videoIdentifier: string, retries = 3) {
+    const errors: string[] = [];
+    const TIMEOUT_MS = 30000; // 30 seconds timeout
+    
+    // Helper function to retry with delay
+    const retryWithDelay = async (fn: () => Promise<any>, delay: number, attempt: number): Promise<any> => {
+        try {
+            return await withTimeout(fn(), TIMEOUT_MS);
+        } catch (error: any) {
+            if (attempt < retries) {
+                console.log(`Retry attempt ${attempt + 1}/${retries} after ${delay}ms delay`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return retryWithDelay(fn, delay * 1.5, attempt + 1);
+            }
+            throw error;
+        }
+    };
+
+    // Try with specific languages first
     for (const lang of TRANSCRIPT_LANGUAGES) {
         try {
-            const transcript = await fetchTranscript(videoIdentifier, { lang });
+            const transcript = await retryWithDelay(
+                () => fetchTranscript(videoIdentifier, { lang }),
+                1000,
+                0
+            );
             if (transcript?.length) {
+                console.log(`Successfully fetched transcript with lang: ${lang}`);
                 return transcript;
             }
-        } catch (error) {
-            console.warn(`Transcript fetch failed for lang ${lang}:`, (error as Error)?.message);
+        } catch (error: any) {
+            const errorMsg = error?.message || String(error);
+            errors.push(`Lang ${lang}: ${errorMsg}`);
+            console.warn(`Transcript fetch failed for lang ${lang}:`, errorMsg);
         }
     }
 
+    // Try without language specification
     try {
-        const transcript = await fetchTranscript(videoIdentifier);
+        const transcript = await retryWithDelay(
+            () => fetchTranscript(videoIdentifier),
+            1000,
+            0
+        );
         if (transcript?.length) {
+            console.log('Successfully fetched transcript without lang specification');
             return transcript;
         }
-    } catch (error) {
-        console.warn('Transcript fetch without lang failed:', (error as Error)?.message);
+    } catch (error: any) {
+        const errorMsg = error?.message || String(error);
+        errors.push(`No lang: ${errorMsg}`);
+        console.warn('Transcript fetch without lang failed:', errorMsg);
     }
 
+    // Log all errors for debugging
+    console.error('All transcript fetch attempts failed:', errors);
     return [];
 }
 
@@ -131,19 +176,31 @@ async function createVectorStoreForVideo({
         : [videoUrl, videoId];
 
     let transcript = [] as Awaited<ReturnType<typeof fetchTranscriptWithFallback>>;
+    let lastError: Error | null = null;
 
     for (const identifier of identifiersToTry) {
-        transcript = await fetchTranscriptWithFallback(identifier);
-        if (transcript?.length) {
-            break;
+        try {
+            console.log(`Attempting to fetch transcript for identifier: ${identifier}`);
+            transcript = await fetchTranscriptWithFallback(identifier);
+            if (transcript?.length) {
+                console.log(`Successfully fetched transcript with ${transcript.length} items`);
+                break;
+            }
+        } catch (error: any) {
+            lastError = error;
+            console.error(`Failed to fetch transcript for ${identifier}:`, error?.message || error);
         }
     }
 
     if (!transcript || transcript.length === 0) {
-        throw new HttpError('Could not fetch transcript. Please check if the video has captions enabled.', 404);
+        const errorMessage = lastError 
+            ? `Could not fetch transcript: ${lastError.message}. Please check if the video has captions enabled and is accessible.`
+            : 'Could not fetch transcript. Please check if the video has captions enabled.';
+        console.error('Transcript fetch failed:', errorMessage);
+        throw new HttpError(errorMessage, 404);
     }
 
-    const fullText = transcript.map(item => item.text).join(' ');
+    const fullText = transcript.map((item: { text: string }) => item.text).join(' ');
     const textSplitter = new CharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
     const chunks = await textSplitter.splitText(fullText);
 
@@ -235,14 +292,26 @@ app.post('/ytchatbot', async (req, res) => {
             });
         } else {
             console.log('Creating new collection for transcript ID:', transcriptId);
-            vectorStore = await createVectorStoreForVideo({
-                videoUrl,
-                videoId,
-                transcriptId,
-                collectionName,
-                embeddings,
-                client,
-            });
+            console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`Video URL: ${videoUrl}, Video ID: ${videoId}`);
+            try {
+                vectorStore = await createVectorStoreForVideo({
+                    videoUrl,
+                    videoId,
+                    transcriptId,
+                    collectionName,
+                    embeddings,
+                    client,
+                });
+            } catch (error: any) {
+                console.error('Error creating vector store:', {
+                    message: error?.message,
+                    stack: error?.stack,
+                    videoUrl,
+                    videoId
+                });
+                throw error;
+            }
         }
 
         // Setup retriever and LLM
