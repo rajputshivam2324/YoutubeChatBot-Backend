@@ -41,6 +41,11 @@ app.use(cors({
 }))
 app.use(express.json({ limit: '50mb' }))
 
+// Health check endpoint for Render
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 
 class HttpError extends Error {
     statusCode: number;
@@ -82,9 +87,26 @@ async function fetchTranscriptWithFallback(videoIdentifier: string) {
     return [];
 }
 
-async function collectionExists(client: CloudClient, collectionName: string) {
-    const collections = await client.listCollections();
-    return collections.some((col: any) => col.name === collectionName);
+async function collectionExists(client: CloudClient, collectionName: string): Promise<boolean> {
+    try {
+        // Try to get the collection directly instead of listing all collections
+        // This avoids warnings from other collections in the database
+        const collection = await client.getCollection({ name: collectionName });
+        return collection !== null && collection !== undefined;
+    } catch (error: any) {
+        // If collection doesn't exist, getCollection will throw an error
+        // Check if it's a "not found" type error
+        if (error?.message?.includes('not found') || error?.message?.includes('does not exist')) {
+            return false;
+        }
+        // For other errors, fall back to listing (but this may trigger warnings)
+        try {
+            const collections = await client.listCollections();
+            return collections.some((col: any) => col.name === collectionName);
+        } catch {
+            return false;
+        }
+    }
 }
 
 type CreateVectorStoreParams = {
@@ -278,4 +300,7 @@ app.post('/ytchatbot', async (req, res) => {
         });
     }
 });
-app.listen(3001);
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
